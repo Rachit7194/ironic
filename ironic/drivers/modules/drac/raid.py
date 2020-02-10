@@ -15,6 +15,7 @@
 DRAC RAID specific methods
 """
 
+from collections import defaultdict
 import math
 
 from futurist import periodics
@@ -26,15 +27,16 @@ from oslo_utils import units
 from ironic.common import exception
 from ironic.common.i18n import _
 from ironic.common import raid as raid_common
-from ironic.common import states
 from ironic.conductor import task_manager
 from ironic.conductor import utils as manager_utils
 from ironic.conf import CONF
 from ironic.drivers import base
+from ironic.drivers.modules import deploy_utils
 from ironic.drivers.modules.drac import common as drac_common
 from ironic.drivers.modules.drac import job as drac_job
 
 drac_exceptions = importutils.try_import('dracclient.exceptions')
+drac_constants = importutils.try_import('dracclient.constants')
 
 LOG = logging.getLogger(__name__)
 
@@ -134,6 +136,46 @@ def list_physical_disks(node):
         raise exception.DracOperationError(error=exc)
 
 
+def _is_raid_controller(node, raid_controller_fqdd, raid_controllers=None):
+    """Find out if object's fqdd is for a raid controller or not
+
+    :param node: an ironic node object
+    :param raid_controller_fqdd: The object's fqdd we are testing to see
+                                 if it is a raid controller or not.
+    :param raid_controllers: A list of RAIDControllers used to check for
+                             the presence of BOSS cards.  If None, the
+                             iDRAC will be queried for the list of
+                             controllers.
+    :returns: boolean, True if the device is a RAID controller,
+              False if not.
+    """
+    client = drac_common.get_drac_client(node)
+
+    try:
+        return client.is_raid_controller(raid_controller_fqdd,
+                                         raid_controllers)
+    except drac_exceptions.BaseClientException as exc:
+        LOG.error('Unable to determine if controller %(raid_controller_fqdd)s '
+                  'on node %(node_uuid)s is a RAID controller. '
+                  'Reason: %(error)s. ',
+                  {'raid_controller_fqdd': raid_controller_fqdd,
+                   'node_uuid': node.uuid, 'error': exc})
+
+        raise exception.DracOperationError(error=exc)
+
+
+def _validate_job_queue(node, raid_controller=None):
+    """Validate that there are no pending jobs for this controller.
+
+    :param node: an ironic node object.
+    :param raid_controller: id of the RAID controller.
+    """
+    kwargs = {}
+    if raid_controller:
+        kwargs["name_prefix"] = "Config:RAID:%s" % raid_controller
+    drac_job.validate_job_queue(node, **kwargs)
+
+
 def create_virtual_disk(node, raid_controller, physical_disks, raid_level,
                         size_mb, disk_name=None, span_length=None,
                         span_depth=None):
@@ -156,7 +198,9 @@ def create_virtual_disk(node, raid_controller, physical_disks, raid_level,
               values to be applied.
     :raises: DracOperationError on an error from python-dracclient.
     """
-    drac_job.validate_job_queue(node)
+    # This causes config to fail, because the boot mode is set via a config
+    # job.
+    _validate_job_queue(node, raid_controller)
 
     client = drac_common.get_drac_client(node)
 
@@ -186,7 +230,8 @@ def delete_virtual_disk(node, virtual_disk):
               values to be applied.
     :raises: DracOperationError on an error from python-dracclient.
     """
-    drac_job.validate_job_queue(node)
+    # NOTE(mgoddard): Cannot specify raid_controller as we don't know it.
+    _validate_job_queue(node)
 
     client = drac_common.get_drac_client(node)
 
@@ -202,20 +247,125 @@ def delete_virtual_disk(node, virtual_disk):
         raise exception.DracOperationError(error=exc)
 
 
-def commit_config(node, raid_controller, reboot=False):
+def _reset_raid_config(node, raid_controller):
+    """Delete all virtual disk and unassign all hotspares physical disk
+
+    :param node: an ironic node object.
+    :param raid_controller: id of the RAID controller.
+    :returns: a dictionary containing
+              - The is_commit_required needed key with a
+              boolean value indicating whether a config job must be created
+              for the values to be applied.
+              - The is_reboot_required key with a RebootRequired enumerated
+              value indicating whether the server must be rebooted to
+              reset configuration.
+    :raises: DracOperationError on an error from python-dracclient.
+    """
+    try:
+
+        _validate_job_queue(node, raid_controller)
+
+        client = drac_common.get_drac_client(node)
+        return client.reset_raid_config(raid_controller)
+    except drac_exceptions.BaseClientException as exc:
+        LOG.error('DRAC driver failed to delete all virtual disk '
+                  'and unassign all hotspares '
+                  'on %(raid_controller_fqdd)s '
+                  'for node %(node_uuid)s. '
+                  'Reason: %(error)s.',
+                  {'raid_controller_fqdd': raid_controller,
+                   'node_uuid': node.uuid,
+                   'error': exc})
+        raise exception.DracOperationError(error=exc)
+
+
+def clear_foreign_config(node, raid_controller):
+    """Free up the foreign drives.
+
+    :param node: an ironic node object.
+    :param raid_controller: id of the RAID controller.
+    :returns: a dictionary containing
+              - The is_commit_required needed key with a
+              boolean value indicating whether a config job must be created
+              for the values to be applied.
+              - The is_reboot_required key with a RebootRequired enumerated
+              value indicating whether the server must be rebooted to
+              clear foreign configuration.
+    :raises: DracOperationError on an error from python-dracclient.
+    """
+    try:
+
+        _validate_job_queue(node, raid_controller)
+
+        client = drac_common.get_drac_client(node)
+        return client.clear_foreign_config(raid_controller)
+    except drac_exceptions.BaseClientException as exc:
+        LOG.error('DRAC driver failed to free foreign driver '
+                  'on %(raid_controller_fqdd)s '
+                  'for node %(node_uuid)s. '
+                  'Reason: %(error)s.',
+                  {'raid_controller_fqdd': raid_controller,
+                   'node_uuid': node.uuid,
+                   'error': exc})
+        raise exception.DracOperationError(error=exc)
+
+
+def change_physical_disk_state(node, mode=None,
+                               controllers_to_physical_disk_ids=None):
+    """Convert disks RAID status
+
+    This method converts the requested physical disks from
+    RAID to JBOD or vice versa.  It does this by only converting the
+    disks that are not already in the correct state.
+
+    :param node: an ironic node object.
+    :param mode: the mode to change the disks either to RAID or JBOD.
+    :param controllers_to_physical_disk_ids: Dictionary of controllers and
+           corresponding disk ids to convert to the requested mode.
+    :return: a dictionary containing:
+             - conversion_results, a dictionary that maps controller ids
+             to the conversion results for that controller.
+             The conversion results are a dict that contains:
+             - The is_commit_required key with the value always set to
+             True indicating that a config job must be created to
+             complete disk conversion.
+             - The is_reboot_required key with a RebootRequired
+             enumerated value indicating whether the server must be
+             rebooted to complete disk conversion.
+    :raises: DRACOperationError on an error from python-dracclient.
+    """
+    try:
+        drac_job.validate_job_queue(node)
+        client = drac_common.get_drac_client(node)
+        return client.change_physical_disk_state(
+            mode, controllers_to_physical_disk_ids)
+    except drac_exceptions.BaseClientException as exc:
+        LOG.error('DRAC driver failed to change physical drives '
+                  'to %(mode)s mode for node %(node_uuid)s. '
+                  'Reason: %(error)s.',
+                  {'mode': mode, 'node_uuid': node.uuid, 'error': exc})
+        raise exception.DracOperationError(error=exc)
+
+
+def commit_config(node, raid_controller, reboot=False, realtime=False):
     """Apply all pending changes on a RAID controller.
 
     :param node: an ironic node object.
     :param raid_controller: id of the RAID controller.
     :param reboot: indicates whether a reboot job should be automatically
                    created with the config job. (optional, defaults to False)
+    :param realtime: indicates RAID controller supports realtime.
+                     (optional, defaults to False)
     :returns: id of the created job
     :raises: DracOperationError on an error from python-dracclient.
     """
     client = drac_common.get_drac_client(node)
 
     try:
-        return client.commit_pending_raid_changes(raid_controller, reboot)
+        return client.commit_pending_raid_changes(
+            raid_controller=raid_controller,
+            reboot=reboot,
+            realtime=realtime)
     except drac_exceptions.BaseClientException as exc:
         LOG.error('DRAC driver failed to commit pending RAID config for'
                   ' controller %(raid_controller_fqdd)s on node '
@@ -224,6 +374,34 @@ def commit_config(node, raid_controller, reboot=False):
                    'node_uuid': node.uuid,
                    'error': exc})
         raise exception.DracOperationError(error=exc)
+
+
+def _change_physical_disk_mode(node, mode=None,
+                               controllers_to_physical_disk_ids=None,
+                               substep="completed"):
+    """Physical drives conversion from RAID to JBOD or vice-versa.
+
+    :param node: an ironic node object.
+    :param mode: the mode to change the disks either to RAID or JBOD.
+    :param controllers_to_physical_disk_ids: Dictionary of controllers and
+           corresponding disk ids to convert to the requested mode.
+    :returns: states.CLEANWAIT if deletion is in progress asynchronously
+              or None if it is completed.
+    """
+    change_disk_state = change_physical_disk_state(
+        node, mode, controllers_to_physical_disk_ids)
+
+    controllers = list()
+    conversion_results = change_disk_state['conversion_results']
+    for controller_id, result in conversion_results.items():
+        controller = {'raid_controller': controller_id,
+                      'is_reboot_required': result['is_reboot_required'],
+                      'is_commit_required': result['is_commit_required']}
+        controllers.append(controller)
+
+    return _commit_to_controllers(
+        node,
+        controllers, substep=substep)
 
 
 def abandon_config(node, raid_controller):
@@ -383,13 +561,18 @@ def _volume_usage_per_disk_mb(logical_disk, physical_disks, spans_count=1,
     return int(stripes_per_disk * stripe_size_kb / units.Ki)
 
 
-def _find_configuration(logical_disks, physical_disks):
+def _find_configuration(logical_disks, physical_disks, pending_delete):
     """Find RAID configuration.
 
     This method transforms the RAID configuration defined in Ironic to a format
     that is required by dracclient. This includes matching the physical disks
     to RAID volumes when it's not pre-defined, or in general calculating
     missing properties.
+
+    :param logical_disks: list of logical disk definitions.
+    :param physical_disks: list of physical disk definitions.
+    :param pending_delete: Whether there is a pending deletion of virtual
+        disks that should be accounted for.
     """
 
     # shared physical disks of RAID volumes size_gb='MAX' should be
@@ -411,7 +594,7 @@ def _find_configuration(logical_disks, physical_disks):
     free_space_mb = {}
     for disk in physical_disks:
         # calculate free disk space
-        free_space_mb[disk] = disk.free_size_mb
+        free_space_mb[disk] = _get_disk_free_size_mb(disk, pending_delete)
 
         disk_type = (disk.controller, disk.media_type, disk.interface_type,
                      disk.size_mb)
@@ -453,7 +636,8 @@ def _find_configuration(logical_disks, physical_disks):
     if volumes_without_disks:
         result, free_space_mb = (
             _assign_disks_to_volume(volumes_without_disks,
-                                    physical_disks_by_type, free_space_mb))
+                                    physical_disks_by_type, free_space_mb,
+                                    pending_delete))
         if not result:
             # try again using the reserved physical disks in addition
             for disk_type, disks in physical_disks_by_type.items():
@@ -463,7 +647,8 @@ def _find_configuration(logical_disks, physical_disks):
             result, free_space_mb = (
                 _assign_disks_to_volume(volumes_without_disks,
                                         physical_disks_by_type,
-                                        free_space_mb))
+                                        free_space_mb,
+                                        pending_delete))
             if not result:
                 error_msg = _('failed to find matching physical disks for all '
                               'logical disks')
@@ -539,7 +724,7 @@ def _calculate_volume_props(logical_disk, physical_disks, free_space_mb):
 
 
 def _assign_disks_to_volume(logical_disks, physical_disks_by_type,
-                            free_space_mb):
+                            free_space_mb, pending_delete):
     logical_disk = logical_disks.pop(0)
     raid_level = logical_disk['raid_level']
 
@@ -567,8 +752,12 @@ def _assign_disks_to_volume(logical_disks, physical_disks_by_type,
         # filter out disks already in use if sharing is disabled
         if ('share_physical_disks' not in logical_disk
                 or not logical_disk['share_physical_disks']):
+            initial_free_size_mb = {
+                disk: _get_disk_free_size_mb(disk, pending_delete)
+                for disk in disks
+            }
             disks = [disk for disk in disks
-                     if disk.free_size_mb == free_space_mb[disk]]
+                     if initial_free_size_mb[disk] == free_space_mb[disk]]
 
         max_spans = _calculate_spans(raid_level, len(disks))
         min_spans = min([2, max_spans])
@@ -604,7 +793,8 @@ def _assign_disks_to_volume(logical_disks, physical_disks_by_type,
                 result, candidate_free_space_mb = (
                     _assign_disks_to_volume(logical_disks,
                                             physical_disks_by_type,
-                                            candidate_free_space_mb))
+                                            candidate_free_space_mb,
+                                            pending_delete))
                 if result:
                     logical_disks.append(candidate_volume)
                     return (True, candidate_free_space_mb)
@@ -630,47 +820,174 @@ def _filter_logical_disks(logical_disks, include_root_volume,
     return filtered_disks
 
 
-def _commit_to_controllers(node, controllers):
-    """Commit changes to RAID controllers on the node."""
+def _create_config_job(node, controller, reboot=False, realtime=False,
+                       raid_config_job_ids=[],
+                       raid_config_parameters=[]):
+    job_id = commit_config(node, raid_controller=controller,
+                           reboot=reboot, realtime=realtime)
+
+    raid_config_job_ids.append(job_id)
+    if controller not in raid_config_parameters:
+        raid_config_parameters.append(controller)
+
+    LOG.info('Change has been committed to RAID controller '
+             '%(controller)s on node %(node)s. '
+             'DRAC job id: %(job_id)s',
+             {'controller': controller, 'node': node.uuid,
+              'job_id': job_id})
+    return {'raid_config_job_ids': raid_config_job_ids,
+            'raid_config_parameters': raid_config_parameters}
+
+
+def _commit_to_controllers(node, controllers, substep="completed"):
+    """Commit changes to RAID controllers on the node.
+
+    :param node: an ironic node object
+    :param controllers: a list of dictionary containing
+                        - The raid_controller key with raid controller
+                        fqdd value indicating on which raid configuration
+                        job needs to be perform.
+                        - The is_commit_required needed key with a
+                        boolean value indicating whether a config job must
+                        be created.
+                        - The is_reboot_required key with a RebootRequired
+                        enumerated value indicating whether the server must
+                        be rebooted only if raid controller does not support
+                        realtime.
+    :param substep: contain sub cleaning or deploy step which executes any raid
+                    configuration job if set after cleaning or deploy step.
+                    (default to completed)
+    :returns: states.CLEANWAIT (cleaning) or states.DEPLOYWAIT (deployment) if
+              configuration is in progress asynchronously or None if it is
+              completed.
+    """
+    # remove controller which does not require configuration job
+    controllers = [controller for controller in controllers
+                   if controller['is_commit_required']]
 
     if not controllers:
         LOG.debug('No changes on any of the controllers on node %s',
                   node.uuid)
+        driver_internal_info = node.driver_internal_info
+        driver_internal_info['raid_config_substep'] = substep
+        driver_internal_info['raid_config_parameters'] = []
+        node.driver_internal_info = driver_internal_info
+        node.save()
         return
 
     driver_internal_info = node.driver_internal_info
+    driver_internal_info['raid_config_substep'] = substep
+    driver_internal_info['raid_config_parameters'] = []
+
     if 'raid_config_job_ids' not in driver_internal_info:
         driver_internal_info['raid_config_job_ids'] = []
 
-    controllers = list(controllers)
-    for controller in controllers:
-        # Do a reboot only for the last controller
-        if controller == controllers[-1]:
-            job_id = commit_config(node, raid_controller=controller,
-                                   reboot=True)
-        else:
-            job_id = commit_config(node, raid_controller=controller,
-                                   reboot=False)
+    optional = drac_constants.RebootRequired.optional
+    all_realtime = all(cntlr['is_reboot_required'] == optional
+                       for cntlr in controllers)
+    raid_config_job_ids = []
+    raid_config_parameters = []
+    if all_realtime:
+        for controller in controllers:
+            realtime_controller = controller['raid_controller']
+            job_details = _create_config_job(
+                node, controller=realtime_controller,
+                reboot=False, realtime=True,
+                raid_config_job_ids=raid_config_job_ids,
+                raid_config_parameters=raid_config_parameters)
 
-        LOG.info('Change has been committed to RAID controller '
-                 '%(controller)s on node %(node)s. '
-                 'DRAC job id: %(job_id)s',
-                 {'controller': controller, 'node': node.uuid,
-                  'job_id': job_id})
+    else:
+        for controller in controllers:
+            mix_controller = controller['raid_controller']
+            reboot = (controller == controllers[-1])
+            job_details = _create_config_job(
+                node, controller=mix_controller,
+                reboot=reboot, realtime=False,
+                raid_config_job_ids=raid_config_job_ids,
+                raid_config_parameters=raid_config_parameters)
 
-        driver_internal_info['raid_config_job_ids'].append(job_id)
+    driver_internal_info['raid_config_job_ids'].extend(job_details[
+        'raid_config_job_ids'])
+
+    driver_internal_info['raid_config_parameters'].extend(job_details[
+        'raid_config_parameters'])
 
     node.driver_internal_info = driver_internal_info
-    node.save()
 
-    return states.CLEANWAIT
+    # Signal whether the node has been rebooted, that we do not need to execute
+    # the step again, and that this completion of this step is triggered
+    # through async polling.
+    # NOTE(mgoddard): set_async_step_flags calls node.save().
+    deploy_utils.set_async_step_flags(
+        node,
+        reboot=not all_realtime,
+        skip_current_step=True,
+        polling=True)
+
+    return deploy_utils.get_async_step_return_state(node)
 
 
-class DracRAID(base.RAIDInterface):
+def _create_virtual_disks(task, node):
+    LOG.debug("Waiting for physical disk conversion to complete "
+              "for node %(node_uuid)s. ", {"node_uuid": node.uuid})
+    drac_job.wait_for_job_completion(node)
+
+    LOG.info(
+        "Completed converting physical disks configured to back RAID "
+        "logical disks to RAID mode for node %(node_uuid)s",
+        {'node_uuid': node.uuid})
+
+    logical_disks_to_create = node.driver_internal_info[
+        'logical_disks_to_create']
+
+    controllers = list()
+    for logical_disk in logical_disks_to_create:
+        controller = dict()
+        controller_cap = create_virtual_disk(
+            node,
+            raid_controller=logical_disk['controller'],
+            physical_disks=logical_disk['physical_disks'],
+            raid_level=logical_disk['raid_level'],
+            size_mb=logical_disk['size_mb'],
+            disk_name=logical_disk.get('name'),
+            span_length=logical_disk.get('span_length'),
+            span_depth=logical_disk.get('span_depth'))
+        controller['raid_controller'] = logical_disk['controller']
+        controller['is_reboot_required'] = controller_cap[
+            'is_reboot_required']
+        controller['is_commit_required'] = controller_cap[
+            'is_commit_required']
+        if controller not in controllers:
+            controllers.append(controller)
+
+    return _commit_to_controllers(node, controllers)
+
+
+def _get_disk_free_size_mb(disk, pending_delete):
+    """Return the size of free space on the disk in MB.
+
+    :param disk: a PhysicalDisk object.
+    :param pending_delete: Whether there is a pending deletion of all virtual
+        disks.
+    """
+    return disk.size_mb if pending_delete else disk.free_size_mb
+
+
+class DracWSManRAID(base.RAIDInterface):
 
     def get_properties(self):
         """Return the properties of the interface."""
         return drac_common.COMMON_PROPERTIES
+
+    @base.deploy_step(priority=0,
+                      argsinfo=base.RAID_APPLY_CONFIGURATION_ARGSINFO)
+    def apply_configuration(self, task, raid_config, create_root_volume=True,
+                            create_nonroot_volumes=False,
+                            delete_existing=True):
+        return super(DracRAID, self).apply_configuration(
+            task, raid_config, create_root_volume=create_root_volume,
+            create_nonroot_volumes=create_nonroot_volumes,
+            delete_existing=delete_existing)
 
     @METRICS.timer('DracRAID.create_configuration')
     @base.clean_step(priority=0, abortable=False, argsinfo={
@@ -687,11 +1004,20 @@ class DracRAID(base.RAIDInterface):
                 'Defaults to `True`.'
             ),
             'required': False
+        },
+        "delete_existing": {
+            "description": (
+                "Setting this to 'True' indicates to delete existing RAID "
+                "configuration prior to creating the new configuration. "
+                "Default value is 'False'."
+            ),
+            "required": False,
         }
     })
     def create_configuration(self, task,
                              create_root_volume=True,
-                             create_nonroot_volumes=True):
+                             create_nonroot_volumes=True,
+                             delete_existing=False):
         """Create the RAID configuration.
 
         This method creates the RAID configuration on the given node.
@@ -703,8 +1029,12 @@ class DracRAID(base.RAIDInterface):
         :param create_nonroot_volumes: If True, non-root volumes are
             created. If False, no non-root volumes are created. Default
             is True.
-        :returns: states.CLEANWAIT if creation is in progress asynchronously
-                  or None if it is completed.
+        :param delete_existing: Setting this to True indicates to delete RAID
+            configuration prior to creating the new configuration. Default is
+            False.
+        :returns: states.CLEANWAIT (cleaning) or states.DEPLOYWAIT (deployment)
+            if creation is in progress asynchronously or None if it is
+            completed.
         :raises: MissingParameterValue, if node.target_raid_config is missing
             or empty.
         :raises: DracOperationError on an error from python-dracclient.
@@ -712,8 +1042,9 @@ class DracRAID(base.RAIDInterface):
         node = task.node
 
         logical_disks = node.target_raid_config['logical_disks']
+
         for disk in logical_disks:
-            if (disk['size_gb'] == 'MAX' and 'physical_disks' not in disk):
+            if disk['size_gb'] == 'MAX' and 'physical_disks' not in disk:
                 raise exception.InvalidParameterValue(
                     _("create_configuration called with invalid "
                       "target_raid_configuration for node %(node_id)s. "
@@ -729,45 +1060,69 @@ class DracRAID(base.RAIDInterface):
 
             del disk['size_gb']
 
+        if delete_existing:
+            controllers = self._delete_configuration_no_commit(task)
+
         physical_disks = list_physical_disks(node)
-        logical_disks = _find_configuration(logical_disks, physical_disks)
+        logical_disks = _find_configuration(logical_disks, physical_disks,
+                                            pending_delete=delete_existing)
 
         logical_disks_to_create = _filter_logical_disks(
             logical_disks, create_root_volume, create_nonroot_volumes)
 
-        controllers = set()
+        controllers_to_physical_disk_ids = defaultdict(list)
         for logical_disk in logical_disks_to_create:
-            controllers.add(logical_disk['controller'])
-            create_virtual_disk(
-                node,
-                raid_controller=logical_disk['controller'],
-                physical_disks=logical_disk['physical_disks'],
-                raid_level=logical_disk['raid_level'],
-                size_mb=logical_disk['size_mb'],
-                disk_name=logical_disk.get('name'),
-                span_length=logical_disk.get('span_length'),
-                span_depth=logical_disk.get('span_depth'))
+            # Not applicable to JBOD logical disks.
+            if logical_disk['raid_level'] == 'JBOD':
+                continue
 
-        return _commit_to_controllers(node, list(controllers))
+            for physical_disk_name in logical_disk['physical_disks']:
+                controllers_to_physical_disk_ids[
+                    logical_disk['controller']].append(
+                    physical_disk_name)
+
+        conversion_results = None
+        if logical_disks_to_create:
+            LOG.debug(
+                "Converting physical disks configured to back RAID "
+                "logical disks to RAID mode for node %(node_uuid)s ",
+                {"node_uuid": node.uuid})
+            raid_mode = drac_constants.RaidStatus.raid
+            conversion_results = _change_physical_disk_mode(
+                node, raid_mode,
+                controllers_to_physical_disk_ids,
+                substep="create_virtual_disks")
+
+        # adding logical_disks to driver_internal_info to create virtual disks
+        driver_internal_info = node.driver_internal_info
+        driver_internal_info[
+            "logical_disks_to_create"] = logical_disks_to_create
+        node.driver_internal_info = driver_internal_info
+        node.save()
+
+        if conversion_results:
+            return conversion_results
+        else:
+            LOG.debug("Controller does not support drives conversion "
+                      "so creating virtual disks")
+            return _create_virtual_disks(task, node)
 
     @METRICS.timer('DracRAID.delete_configuration')
     @base.clean_step(priority=0)
+    @base.deploy_step(priority=0)
     def delete_configuration(self, task):
         """Delete the RAID configuration.
 
         :param task: a TaskManager instance containing the node to act on.
-        :returns: states.CLEANWAIT if deletion is in progress asynchronously
-                  or None if it is completed.
+        :returns: states.CLEANWAIT (cleaning) or states.DEPLOYWAIT (deployment)
+            if deletion is in progress asynchronously or None if it is
+            completed.
         :raises: DracOperationError on an error from python-dracclient.
         """
-        node = task.node
 
-        controllers = set()
-        for disk in list_virtual_disks(node):
-            controllers.add(disk.controller)
-            delete_virtual_disk(node, disk.id)
-
-        return _commit_to_controllers(node, list(controllers))
+        controllers = self._delete_configuration_no_commit(task)
+        return _commit_to_controllers(task.node, controllers,
+                                      substep="delete_foreign_config")
 
     @METRICS.timer('DracRAID.get_logical_disks')
     def get_logical_disks(self, task):
@@ -841,9 +1196,9 @@ class DracRAID(base.RAIDInterface):
         for config_job_id in raid_config_job_ids:
             config_job = drac_job.get_job(node, job_id=config_job_id)
 
-            if config_job.state == 'Completed':
+            if config_job is None or config_job.status == 'Completed':
                 finished_job_ids.append(config_job_id)
-            elif config_job.state == 'Failed':
+            elif config_job.status == 'Failed':
                 finished_job_ids.append(config_job_id)
                 self._set_raid_config_job_failure(node)
 
@@ -853,13 +1208,74 @@ class DracRAID(base.RAIDInterface):
         task.upgrade_lock()
         self._delete_cached_config_job_id(node, finished_job_ids)
 
-        if not node.driver_internal_info['raid_config_job_ids']:
-            if not node.driver_internal_info.get('raid_config_job_failure',
-                                                 False):
-                self._resume_cleaning(task)
+        if not node.driver_internal_info.get('raid_config_job_failure',
+                                             False):
+            if 'raid_config_substep' in node.driver_internal_info:
+                substep = node.driver_internal_info['raid_config_substep']
+
+                if substep == 'delete_foreign_config':
+                    foreign_drives = self._execute_foreign_drives(task, node)
+                    if foreign_drives is None:
+                        return self._convert_drives(task, node)
+                elif substep == 'physical_disk_conversion':
+                    self._convert_drives(task, node)
+                elif substep == "create_virtual_disks":
+                    return _create_virtual_disks(task, node)
+                elif substep == 'completed':
+                    self._complete_raid_substep(task, node)
             else:
-                self._clear_raid_config_job_failure(node)
-                self._set_clean_failed(task, config_job)
+                self._complete_raid_substep(task, node)
+        else:
+            self._clear_raid_substep(node)
+            self._clear_raid_config_job_failure(node)
+            self._set_failed(task, config_job)
+
+    def _execute_foreign_drives(self, task, node):
+        controllers = list()
+        jobs_required = False
+        for controller_id in node.driver_internal_info[
+                'raid_config_parameters']:
+            controller_cap = clear_foreign_config(
+                node, controller_id)
+            controller = {
+                'raid_controller': controller_id,
+                'is_reboot_required': controller_cap['is_reboot_required'],
+                'is_commit_required': controller_cap['is_commit_required']}
+            controllers.append(controller)
+            jobs_required = jobs_required or controller_cap[
+                'is_commit_required']
+
+        if not jobs_required:
+            LOG.info(
+                "No foreign drives detected, so "
+                "resume %s", "cleaning" if node.clean_step else "deployment")
+            return None
+        else:
+            return _commit_to_controllers(
+                node,
+                controllers,
+                substep='physical_disk_conversion')
+
+    def _complete_raid_substep(self, task, node):
+        self._clear_raid_substep(node)
+        self._resume(task)
+
+    def _convert_drives(self, task, node):
+        jbod = drac_constants.RaidStatus.jbod
+        drives_results = _change_physical_disk_mode(
+            node, mode=jbod)
+        if drives_results is None:
+            LOG.debug("Controller does not support drives "
+                      "conversion on %(node_uuid)s",
+                      {'node_uuid': node.uuid})
+            self._complete_raid_substep(task, node)
+
+    def _clear_raid_substep(self, node):
+        driver_internal_info = node.driver_internal_info
+        driver_internal_info.pop('raid_config_substep', None)
+        driver_internal_info.pop('raid_config_parameters', None)
+        node.driver_internal_info = driver_internal_info
+        node.save()
 
     def _set_raid_config_job_failure(self, node):
         driver_internal_info = node.driver_internal_info
@@ -884,7 +1300,7 @@ class DracRAID(base.RAIDInterface):
         node.driver_internal_info = driver_internal_info
         node.save()
 
-    def _set_clean_failed(self, task, config_job):
+    def _set_failed(self, task, config_job):
         LOG.error("RAID configuration job failed for node %(node)s. "
                   "Failed config job: %(config_job_id)s. "
                   "Message: '%(message)s'.",
@@ -893,11 +1309,49 @@ class DracRAID(base.RAIDInterface):
         task.node.last_error = config_job.message
         task.process_event('fail')
 
-    def _resume_cleaning(self, task):
+    def _resume(self, task):
         raid_common.update_raid_info(
             task.node, self.get_logical_disks(task))
-        driver_internal_info = task.node.driver_internal_info
-        driver_internal_info['cleaning_reboot'] = True
-        task.node.driver_internal_info = driver_internal_info
-        task.node.save()
-        manager_utils.notify_conductor_resume_clean(task)
+        if task.node.clean_step:
+            manager_utils.notify_conductor_resume_clean(task)
+        else:
+            manager_utils.notify_conductor_resume_deploy(task)
+
+    def _delete_configuration_no_commit(self, task):
+        """Delete existing RAID configuration without committing the change.
+
+        :param task: A TaskManager instance.
+        :returns: A set of names of RAID controllers which need RAID changes to
+            be committed.
+        """
+        node = task.node
+        controllers = list()
+        drac_raid_controllers = list_raid_controllers(node)
+        for cntrl in drac_raid_controllers:
+            if _is_raid_controller(node, cntrl.id, drac_raid_controllers):
+                controller = dict()
+                controller_cap = _reset_raid_config(node, cntrl.id)
+                controller["raid_controller"] = cntrl.id
+                controller["is_reboot_required"] = controller_cap[
+                    "is_reboot_required"]
+                controller["is_commit_required"] = controller_cap[
+                    "is_commit_required"]
+                controllers.append(controller)
+        return controllers
+
+
+class DracRAID(DracWSManRAID):
+    """Class alias of class DracWSManRAID.
+
+    This class provides ongoing support of the deprecated 'idrac' RAID
+    interface implementation entrypoint.
+
+    All bug fixes and new features should be implemented in its base
+    class, DracWSManRAID. That makes them available to both the
+    deprecated 'idrac' and new 'idrac-wsman' entrypoints. Such changes
+    should not be made to this class.
+    """
+
+    def __init__(self):
+        LOG.warning("RAID interface 'idrac' is deprecated and may be removed "
+                    "in a future release. Use 'idrac-wsman' instead.")
