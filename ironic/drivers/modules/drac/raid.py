@@ -310,6 +310,74 @@ def clear_foreign_config(node, raid_controller):
         raise exception.DracOperationError(error=exc)
 
 
+def set_raid_settings(node, controller_fqdd, settings):
+    """Sets the RAID configuration
+
+        It sets the pending_value parameter for each of the attributes
+        passed in. For the values to be applied, a config job must
+        be created.
+        :param node: an ironic node object.
+        :param controller_fqdd: the FQDD of the RAID setting.
+        :param settings: a dictionary containing the proposed values, with
+                         each key being the name of attribute and the value
+                         being the proposed value.
+        :returns: a dictionary containing:
+                 - The is_commit_required key with a boolean value indicating
+                   whether a config job must be created for the values to be
+                   applied.
+                 - The is_reboot_required key with a RebootRequired enumerated
+                   value indicating whether the server must be rebooted for the
+                   values to be applied. Possible values are true and false.
+        :raises: WSManRequestFailure on request failures
+        :raises: WSManInvalidResponse when receiving invalid response
+        :raises: DRACOperationFailed on error reported back by the DRAC
+                 interface
+    """
+    try:
+
+        drac_job.validate_job_queue(node)
+
+        client = drac_common.get_drac_client(node)
+        return client.set_raid_settings(controller_fqdd, settings)
+    except drac_exceptions.BaseClientException as exc:
+        LOG.error('DRAC driver failed to set raid settings '
+                  'on %(raid_controller_fqdd)s '
+                  'for node %(node_uuid)s. '
+                  'Reason: %(error)s.',
+                  {'raid_controller_fqdd': controller_fqdd,
+                   'node_uuid': node.uuid,
+                   'error': exc})
+        raise exception.DracOperationError(error=exc)
+
+
+def list_raid_settings(node):
+    """List the RAID configuration settings
+
+    :param node: an ironic node object.
+    :returns: a dictionary with the RAID settings using InstanceID as the
+              key. The attributes are either RAIDEnumerableAttribute,
+              RAIDStringAttribute objects.
+    :raises: WSManRequestFailure on request failures
+    :raises: WSManInvalidResponse when receiving invalid response
+    :raises: DRACOperationFailed on error reported back by the DRAC
+             interface
+    """
+    try:
+
+        drac_job.validate_job_queue(node)
+
+        client = drac_common.get_drac_client(node)
+        return client.list_raid_settings()
+    except drac_exceptions.BaseClientException as exc:
+        LOG.error('DRAC driver failed to  list raid settings'
+                  'on %(raid_controller_fqdd)s '
+                  'for node %(node_uuid)s. '
+                  'Reason: %(error)s.',
+                  {'node_uuid': node.uuid,
+                   'error': exc})
+        raise exception.DracOperationError(error=exc)
+
+
 def change_physical_disk_state(node, mode=None,
                                controllers_to_physical_disk_ids=None):
     """Convert disks RAID status
@@ -996,6 +1064,37 @@ def _create_virtual_disks(task, node):
     return _commit_to_controllers(node, controllers)
 
 
+def _config_raid_settings(node):
+    raid_settings = list_raid_settings(node)
+    controllers = list_raid_controllers(node)
+    raid_controller = [cntrl for cntrl in controllers
+                       if cntrl.model.startswith('PERC H740P')][0]
+
+    controllers = list()
+
+    # check the raid controller mode
+    raid_controller_mode = raid_settings.get(
+        "{}:RAIDCurrentControllerMode".format(raid_controller.id))
+    raid_controller_mode = raid_controller_mode.current_value
+
+    # if e-HBA found then change it to RAID
+    if "Enhanced HBA" in raid_controller_mode:
+        # change raid controller mode here
+        raid_attr = "{}:RAIDRequestedControllerMode".format(raid_controller.id)
+        settings = {raid_attr: 'RAID'}
+        settings_results = set_raid_settings(
+            node, raid_controller.id, settings)
+        controller = {
+            'raid_controller': raid_controller.id,
+            'is_reboot_required': settings_results['is_reboot_required'],
+            'is_commit_required': settings_results['is_commit_required']}
+        controllers.append(controller)
+
+    return _commit_to_controllers(
+        node,
+        controllers, substep="delete_foreign_config")
+
+
 def _get_disk_free_size_mb(disk, pending_delete):
     """Return the size of free space on the disk in MB.
 
@@ -1248,6 +1347,14 @@ class DracWSManRAID(base.RAIDInterface):
                                              False):
             if 'raid_config_substep' in node.driver_internal_info:
                 substep = node.driver_internal_info['raid_config_substep']
+
+                # check if raid controller is in RAID mode
+                if substep == 'check_raid_config':
+                    raid_results = _config_raid_settings(node)
+                    if raid_results is None:
+                        # proceed to next substep
+                        substep = node.driver_internal_info[
+                            'raid_config_substep']
 
                 if substep == 'delete_foreign_config':
                     foreign_drives = self._execute_foreign_drives(task, node)
