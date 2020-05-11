@@ -356,7 +356,7 @@ def list_raid_settings(node):
     :param node: an ironic node object.
     :returns: a dictionary with the RAID settings using InstanceID as the
               key. The attributes are either RAIDEnumerableAttribute,
-              RAIDStringAttribute objects.
+              RAIDIntegerAttribute objects.
     :raises: WSManRequestFailure on request failures
     :raises: WSManInvalidResponse when receiving invalid response
     :raises: DRACOperationFailed on error reported back by the DRAC
@@ -1064,28 +1064,35 @@ def _create_virtual_disks(task, node):
     return _commit_to_controllers(node, controllers)
 
 
+def controller_supports_ehba_mode(settings, controller_fqdd):
+    # check the raid controller mode
+    raid_controller_mode = settings.get(
+        "{}:RAIDCurrentControllerMode".format(controller_fqdd))
+    raid_controller_mode = raid_controller_mode.current_value
+
+    # if e-HBA found then return True
+    if "Enhanced HBA" in raid_controller_mode:
+        return True
+    else:
+        return False
+
+
 def _config_raid_settings(node):
     raid_settings = list_raid_settings(node)
     controllers = list_raid_controllers(node)
-    raid_controller = [cntrl for cntrl in controllers
-                       if cntrl.model.startswith('PERC H740P')][0]
+    raid_controllers = [cntrl for cntrl in controllers
+                        if cntrl.model.startswith('PERC H740P')
+                        and controller_supports_ehba_mode(raid_settings,
+                                                          cntrl.id)]
 
     controllers = list()
-
-    # check the raid controller mode
-    raid_controller_mode = raid_settings.get(
-        "{}:RAIDCurrentControllerMode".format(raid_controller.id))
-    raid_controller_mode = raid_controller_mode.current_value
-
-    # if e-HBA found then change it to RAID
-    if "Enhanced HBA" in raid_controller_mode:
-        # change raid controller mode here
-        raid_attr = "{}:RAIDRequestedControllerMode".format(raid_controller.id)
+    for controller in raid_controllers:
+        raid_attr = "{}:RAIDRequestedControllerMode".format(controller.id)
         settings = {raid_attr: 'RAID'}
         settings_results = set_raid_settings(
-            node, raid_controller.id, settings)
+            node, controller.id, settings)
         controller = {
-            'raid_controller': raid_controller.id,
+            'raid_controller': controller.id,
             'is_reboot_required': settings_results['is_reboot_required'],
             'is_commit_required': settings_results['is_commit_required']}
         controllers.append(controller)
