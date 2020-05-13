@@ -358,7 +358,7 @@ def list_raid_settings(node):
     :param node: an ironic node object.
     :returns: a dictionary with the RAID settings using InstanceID as the
               key. The attributes are either RAIDEnumerableAttribute,
-              RAIDIntegerAttribute objects.
+              RAIDStringAttribute objects.
     :raises: WSManRequestFailure on request failures
     :raises: WSManInvalidResponse when receiving invalid response
     :raises: DRACOperationFailed on error reported back by the DRAC
