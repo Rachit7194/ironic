@@ -42,6 +42,8 @@ LOG = logging.getLogger(__name__)
 
 METRICS = metrics_utils.get_metrics_logger(__name__)
 
+_CURRENT_RAID_CONTROLLER_MODE = "RAIDCurrentControllerMode"
+
 RAID_LEVELS = {
     '0': {
         'min_disks': 1,
@@ -1064,14 +1066,35 @@ def _create_virtual_disks(task, node):
     return _commit_to_controllers(node, controllers)
 
 
-def controller_supports_ehba_mode(settings, controller_fqdd):
-    # check the raid controller mode
-    raid_controller_mode = settings.get(
-        "{}:RAIDCurrentControllerMode".format(controller_fqdd))
-    raid_controller_mode = raid_controller_mode.current_value
+def _controller_in_hba_mode(raid_settings, controller_fqdd):
+    controller_mode = raid_settings.get(
+        '{}:{}'.format(controller_fqdd, _CURRENT_RAID_CONTROLLER_MODE))
 
-    # if e-HBA found then return True
-    if "Enhanced HBA" in raid_controller_mode:
+    if "Enhanced HBA" in controller_mode.current_value:
+        return True
+    else:
+        return False
+
+
+def _controller_supports_ehba_mode(settings, controller_fqdd):
+    # check the raid controller suppports HBA mode
+    raid_controller_mode = {sett: value.possible_values for sett, value in
+                            settings.items() if _CURRENT_RAID_CONTROLLER_MODE
+                            in sett}
+
+    if not raid_controller_mode:
+        # Raid controller does not support HBA mode
+        return False
+
+    raid_cntrl_attr = "{}:{}".format(
+        controller_fqdd,_CURRENT_RAID_CONTROLLER_MODE)
+
+    raid_cntrl_attr = raid_cntrl_attr if raid_cntrl_attr\
+        in raid_controller_mode.keys() else None
+
+    if  raid_cntrl_attr and "Enhanced HBA" in raid_controller_mode[
+        raid_cntrl_attr]:
+        # raid controller supports HBA mode
         return True
     else:
         return False
@@ -1080,22 +1103,24 @@ def controller_supports_ehba_mode(settings, controller_fqdd):
 def _config_raid_settings(node):
     raid_settings = list_raid_settings(node)
     controllers = list_raid_controllers(node)
+    # Get all the raid controllers that supports HBA mode
     raid_controllers = [cntrl for cntrl in controllers
-                        if cntrl.model.startswith('PERC H740P')
-                        and controller_supports_ehba_mode(raid_settings,
+                        if _controller_supports_ehba_mode(raid_settings,
                                                           cntrl.id)]
 
     controllers = list()
     for controller in raid_controllers:
-        raid_attr = "{}:RAIDRequestedControllerMode".format(controller.id)
-        settings = {raid_attr: 'RAID'}
-        settings_results = set_raid_settings(
-            node, controller.id, settings)
-        controller = {
-            'raid_controller': controller.id,
-            'is_reboot_required': settings_results['is_reboot_required'],
-            'is_commit_required': settings_results['is_commit_required']}
-        controllers.append(controller)
+        # check if controller is in enhanced HBA mode
+        if _controller_in_hba_mode(raid_settings, controller.id):
+            raid_attr = "{}:RAIDRequestedControllerMode".format(controller.id)
+            settings = {raid_attr: 'RAID'}
+            settings_results = set_raid_settings(
+                node, controller.id, settings)
+            controller = {
+                'raid_controller': controller.id,
+                'is_reboot_required': settings_results['is_reboot_required'],
+                'is_commit_required': settings_results['is_commit_required']}
+            controllers.append(controller)
 
     return _commit_to_controllers(
         node,
