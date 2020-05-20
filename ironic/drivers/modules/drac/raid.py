@@ -43,6 +43,7 @@ LOG = logging.getLogger(__name__)
 METRICS = metrics_utils.get_metrics_logger(__name__)
 
 _CURRENT_RAID_CONTROLLER_MODE = "RAIDCurrentControllerMode"
+_EHBA_MODE = "Enhanced HBA"
 
 RAID_LEVELS = {
     '0': {
@@ -358,7 +359,7 @@ def list_raid_settings(node):
     :param node: an ironic node object.
     :returns: a dictionary with the RAID settings using InstanceID as the
               key. The attributes are either RAIDEnumerableAttribute,
-              RAIDStringAttribute objects.
+              RAIDStringAttribute and RAIDIntegerAttribute objects.
     :raises: WSManRequestFailure on request failures
     :raises: WSManInvalidResponse when receiving invalid response
     :raises: DRACOperationFailed on error reported back by the DRAC
@@ -944,6 +945,21 @@ def _validate_volume_size(node, logical_disks):
     return logical_disks
 
 
+def _configure_raid_settings(node, controller_fqdd):
+    # wait for pending jobs to complete
+    drac_job.wait_for_job_completion(node)
+
+    raid_attr = "{}:RAIDRequestedControllerMode".format(controller_fqdd)
+    settings = {raid_attr: 'RAID'}
+    settings_results = set_raid_settings(
+        node, controller_fqdd, settings)
+    controller = {
+        'raid_controller': controller_fqdd,
+        'is_reboot_required': settings_results['is_reboot_required'],
+        'is_commit_required': settings_results['is_commit_required']}
+    return controller
+
+
 def _commit_to_controllers(node, controllers, substep="completed"):
     """Commit changes to RAID controllers on the node.
 
@@ -990,6 +1006,11 @@ def _commit_to_controllers(node, controllers, substep="completed"):
     optional = drac_constants.RebootRequired.optional
     all_realtime = all(cntlr['is_reboot_required'] == optional
                        for cntlr in controllers)
+
+    # filter out controllers having ehba mode
+    any_ehba_controllers = [cntrl for cntrl in controllers
+                            if "is_ehba_mode" in cntrl]
+
     raid_config_job_ids = []
     raid_config_parameters = []
     if all_realtime:
@@ -1000,6 +1021,32 @@ def _commit_to_controllers(node, controllers, substep="completed"):
                 reboot=False, realtime=True,
                 raid_config_job_ids=raid_config_job_ids,
                 raid_config_parameters=raid_config_parameters)
+            if 'is_ehba_mode' in controller and controller['is_ehba_mode']:
+                ehba_controller = _configure_raid_settings(
+                    node, controller['raid_controller'])
+                reboot = (controller == controllers[-1])
+                job_details = _create_config_job(
+                    node, controller=ehba_controller['raid_controller'],
+                    reboot=reboot, realtime=False,
+                    raid_config_job_ids=raid_config_job_ids)
+
+    elif any_ehba_controllers:
+        for controller in any_ehba_controllers:
+            mix_controller = controller['raid_controller']
+            reboot = (controller == controllers[-1])
+            realtime = controller['is_reboot_required'] == optional
+            job_details = _create_config_job(
+                node, controller=mix_controller,
+                reboot=reboot, realtime=realtime,
+                raid_config_job_ids=raid_config_job_ids,
+                raid_config_parameters=raid_config_parameters)
+            if 'is_ehba_mode' in controller and controller['is_ehba_mode']:
+                ehba_controller = _configure_raid_settings(
+                    node, controller['raid_controller'])
+                job_details = _create_config_job(
+                    node, controller=ehba_controller['raid_controller'],
+                    reboot=False, realtime=False,
+                    raid_config_job_ids=raid_config_job_ids)
 
     else:
         for controller in controllers:
@@ -1010,6 +1057,13 @@ def _commit_to_controllers(node, controllers, substep="completed"):
                 reboot=reboot, realtime=False,
                 raid_config_job_ids=raid_config_job_ids,
                 raid_config_parameters=raid_config_parameters)
+            if controller['is_ehba_mode']:
+                ehba_controller = _configure_raid_settings(
+                    node, mix_controller['raid_controller'])
+                job_details = _create_config_job(
+                    controller=ehba_controller['raid_controller'],
+                    reboot=False, realtime=False,
+                    raid_config_job_ids=raid_config_job_ids)
 
     driver_internal_info['raid_config_job_ids'].extend(job_details[
         'raid_config_job_ids'])
@@ -1070,61 +1124,22 @@ def _controller_in_hba_mode(raid_settings, controller_fqdd):
     controller_mode = raid_settings.get(
         '{}:{}'.format(controller_fqdd, _CURRENT_RAID_CONTROLLER_MODE))
 
-    if "Enhanced HBA" in controller_mode.current_value:
+    if _EHBA_MODE in controller_mode.current_value:
         return True
     else:
         return False
 
 
 def _controller_supports_ehba_mode(settings, controller_fqdd):
-    # check the raid controller suppports HBA mode
-    raid_controller_mode = {sett: value.possible_values for sett, value in
-                            settings.items() if _CURRENT_RAID_CONTROLLER_MODE
-                            in sett}
-
-    if not raid_controller_mode:
-        # Raid controller does not support HBA mode
+    raid_cntrl_attr = "{}:{}".format(controller_fqdd,
+                                     _CURRENT_RAID_CONTROLLER_MODE)
+    current_cntrl_mode = settings.get(raid_cntrl_attr)
+    if not current_cntrl_mode:
         return False
-
-    raid_cntrl_attr = "{}:{}".format(
-        controller_fqdd,_CURRENT_RAID_CONTROLLER_MODE)
-
-    raid_cntrl_attr = raid_cntrl_attr if raid_cntrl_attr\
-        in raid_controller_mode.keys() else None
-
-    if  raid_cntrl_attr and "Enhanced HBA" in raid_controller_mode[
-        raid_cntrl_attr]:
-        # raid controller supports HBA mode
+    elif _EHBA_MODE in current_cntrl_mode.possible_values:
         return True
     else:
         return False
-
-
-def _config_raid_settings(node):
-    raid_settings = list_raid_settings(node)
-    controllers = list_raid_controllers(node)
-    # Get all the raid controllers that supports HBA mode
-    raid_controllers = [cntrl for cntrl in controllers
-                        if _controller_supports_ehba_mode(raid_settings,
-                                                          cntrl.id)]
-
-    controllers = list()
-    for controller in raid_controllers:
-        # check if controller is in enhanced HBA mode
-        if _controller_in_hba_mode(raid_settings, controller.id):
-            raid_attr = "{}:RAIDRequestedControllerMode".format(controller.id)
-            settings = {raid_attr: 'RAID'}
-            settings_results = set_raid_settings(
-                node, controller.id, settings)
-            controller = {
-                'raid_controller': controller.id,
-                'is_reboot_required': settings_results['is_reboot_required'],
-                'is_commit_required': settings_results['is_commit_required']}
-            controllers.append(controller)
-
-    return _commit_to_controllers(
-        node,
-        controllers, substep="delete_foreign_config")
 
 
 def _get_disk_free_size_mb(disk, pending_delete):
@@ -1380,14 +1395,6 @@ class DracWSManRAID(base.RAIDInterface):
             if 'raid_config_substep' in node.driver_internal_info:
                 substep = node.driver_internal_info['raid_config_substep']
 
-                # check if raid controller is in RAID mode
-                if substep == 'check_raid_config':
-                    raid_results = _config_raid_settings(node)
-                    if raid_results is None:
-                        # proceed to next substep
-                        substep = node.driver_internal_info[
-                            'raid_config_substep']
-
                 if substep == 'delete_foreign_config':
                     foreign_drives = self._execute_foreign_drives(task, node)
                     if foreign_drives is None:
@@ -1502,9 +1509,17 @@ class DracWSManRAID(base.RAIDInterface):
         node = task.node
         controllers = list()
         drac_raid_controllers = list_raid_controllers(node)
+        drac_raid_settings = list_raid_settings(node)
         for cntrl in drac_raid_controllers:
             if _is_raid_controller(node, cntrl.id, drac_raid_controllers):
                 controller = dict()
+                if _controller_supports_ehba_mode(
+                        drac_raid_settings,
+                        cntrl.id) and _controller_in_hba_mode(
+                            drac_raid_settings, cntrl.id):
+                    controller['is_ehba_mode'] = True
+                else:
+                    controller['is_ehba_mode'] = False
                 controller_cap = _reset_raid_config(node, cntrl.id)
                 controller["raid_controller"] = cntrl.id
                 controller["is_reboot_required"] = controller_cap[
